@@ -10,6 +10,7 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
+import { hermeticDir } from "./helpers/boot-extension.js";
 
 function makePi() {
   const tools = new Map<string, any>();
@@ -53,7 +54,7 @@ function makeHeadlessCtx() {
       setStatus: vi.fn(),
       setWidget: vi.fn(),
     },
-    cwd: "/tmp",
+    cwd: process.cwd(),
     model: undefined,
     modelRegistry: {
       find: vi.fn(),
@@ -64,13 +65,24 @@ function makeHeadlessCtx() {
       getBranch: vi.fn(() => []),
     },
     getSystemPrompt: vi.fn(() => "parent prompt"),
+    isIdle: vi.fn(() => true),
   } as any;
 }
 
 describe("print mode background notifications", () => {
-  afterEach(() => {
-    vi.restoreAllMocks();
-    vi.useRealTimers();
+  let hermetic: ReturnType<typeof hermeticDir> | undefined;
+  let shutdown: (() => Promise<void>) | undefined;
+
+  afterEach(async () => {
+    try {
+      await shutdown?.();
+    } finally {
+      shutdown = undefined;
+      hermetic?.restore();
+      hermetic = undefined;
+      vi.restoreAllMocks();
+      vi.useRealTimers();
+    }
   });
 
   it("ignores stale-context errors from delayed completion nudges", async () => {
@@ -81,9 +93,13 @@ describe("print mode background notifications", () => {
       steered: false,
     });
 
+    hermetic = hermeticDir({ settings: { schedulingEnabled: false, outputTranscript: false } });
     const { pi, tools, handlers } = makePi();
     subagentsExtension(pi);
     vi.useFakeTimers();
+    const headlessCtx = makeHeadlessCtx();
+    shutdown = () => handlers.get("session_shutdown")?.({}, headlessCtx);
+    await handlers.get("session_start")?.({ type: "session_start" }, headlessCtx);
 
     const agentTool = tools.get("Agent");
     await agentTool.execute(
@@ -96,14 +112,12 @@ describe("print mode background notifications", () => {
       },
       undefined,
       undefined,
-      makeHeadlessCtx(),
+      headlessCtx,
     );
 
     await vi.advanceTimersByTimeAsync(100); // smart-join batch debounce
     await vi.advanceTimersByTimeAsync(200); // notification hold window
 
     expect(pi.sendMessage).toHaveBeenCalled();
-
-    await handlers.get("session_shutdown")?.({}, makeHeadlessCtx());
   });
 });

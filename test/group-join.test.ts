@@ -123,6 +123,67 @@ describe("GroupJoinManager", () => {
     expect(deliver.mock.calls[1][1]).toBe(false);
   });
 
+  it("pins the first completion even when a same-millisecond resume finishes before the old group", () => {
+    const deliver = vi.fn<(records: AgentRecord[], partial: boolean) => void>();
+    const mgr = new GroupJoinManager(deliver);
+    const a = makeRecord("a", { generation: 0, result: "old", completedAt: 100 });
+    mgr.registerGroup("old", ["a", "b"]);
+    expect(mgr.onAgentComplete(a)).toBe("held");
+
+    a.generation = 1;
+    a.resultConsumed = false;
+    a.result = "resumed";
+    a.completedAt = 100;
+    expect(mgr.onAgentComplete(a)).toBe("pass");
+    expect(mgr.onAgentComplete(makeRecord("b", { generation: 0 }))).toBe("delivered");
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(deliver.mock.calls[0][0].map(record => record.id)).toEqual(["b"]);
+  });
+
+  it("leaves the live original record for consumption checks at notification time", () => {
+    const deliver = vi.fn<(records: AgentRecord[], partial: boolean) => void>();
+    const mgr = new GroupJoinManager(deliver);
+    const a = makeRecord("a", { generation: 0 });
+    mgr.registerGroup("old", ["a", "b"]);
+    mgr.onAgentComplete(a);
+    a.resultConsumed = true;
+    mgr.onAgentComplete(makeRecord("b"));
+    expect(deliver.mock.calls[0][0][0]).toBe(a);
+    expect(deliver.mock.calls[0][0][0].resultConsumed).toBe(true);
+  });
+
+  it("does not erase a newer group registration when the old group delivers", () => {
+    const deliver = vi.fn<(records: AgentRecord[], partial: boolean) => void>();
+    const mgr = new GroupJoinManager(deliver);
+    const a = makeRecord("a", { generation: 0 });
+    mgr.registerGroup("old", ["a", "b"]);
+    mgr.onAgentComplete(a);
+    a.generation = 1;
+    mgr.registerGroup("new", ["a", "c"]);
+    mgr.onAgentComplete(makeRecord("b"));
+    expect(deliver.mock.calls[0][0].map(record => record.id)).toEqual(["b"]);
+    expect(mgr.isGrouped("a")).toBe(true);
+    expect(mgr.onAgentComplete(a)).toBe("held");
+    expect(mgr.onAgentComplete(makeRecord("c"))).toBe("delivered");
+    expect(deliver.mock.calls[1][0].map(record => record.id)).toEqual(["a", "c"]);
+  });
+
+  it("does not erase a newer group registration when the old group times out", () => {
+    const deliver = vi.fn<(records: AgentRecord[], partial: boolean) => void>();
+    const mgr = new GroupJoinManager(deliver, 30_000);
+    const a = makeRecord("a", { generation: 0 });
+    mgr.registerGroup("old", ["a", "b"]);
+    mgr.onAgentComplete(a);
+    a.generation = 1;
+    mgr.registerGroup("new", ["a", "c"]);
+    vi.advanceTimersByTime(30_000);
+    expect(deliver).not.toHaveBeenCalled();
+    expect(mgr.isGrouped("a")).toBe(true);
+    expect(mgr.onAgentComplete(a)).toBe("held");
+    expect(mgr.onAgentComplete(makeRecord("c"))).toBe("delivered");
+    expect(deliver.mock.calls[0][0].map(record => record.id)).toEqual(["a", "c"]);
+  });
+
   it("returns 'pass' for late completions arriving after a group is already delivered", () => {
     const deliver = vi.fn();
     const mgr = new GroupJoinManager(deliver);

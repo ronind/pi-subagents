@@ -3,10 +3,10 @@
  * REAL session lifecycle handlers + the REAL get_subagent_result tool.
  *
  * Bug: a background agent that has COMPLETED but whose result the LLM hasn't read
- * yet (resultConsumed=false) was wiped by clearCompleted() on session_start /
- * session_before_switch, so the next get_subagent_result returned "Agent not
- * found". The fix makes both handlers call clearCompleted(true), preserving
- * unread records (the 10-minute timer evicts them later).
+ * yet (resultConsumed=false) was wiped by clearCompleted() on session_start,
+ * so the next get_subagent_result returned "Agent not found". The confirmed
+ * session_start preserves unread records; a vetoable before-switch does not
+ * clear anything (the 10-minute timer evicts unread records later).
  *
  * These tests exercise the wiring, not the manager method in isolation: spawn a
  * real background agent, let it complete, fire the real session event, then read
@@ -27,7 +27,7 @@ import subagentsExtension from "../src/index.js";
 
 function makePi() {
   const tools = new Map<string, any>();
-  const lifecycle = new Map<string, any>(); // pi.on(...) — session_start, session_before_switch, session_shutdown
+  const lifecycle = new Map<string, any>(); // pi.on(...) — session_start, session_shutdown
   const events = new Map<string, any>(); // pi.events.on(...) — subagents:rpc:*, etc.
   const pi = {
     registerMessageRenderer: vi.fn(),
@@ -155,7 +155,7 @@ describe("issue #108: unread completed background agents survive session events"
     await lifecycle.get("session_shutdown")?.({}, ctx());
   });
 
-  it("once read, a session switch DOES evict it — the fix stays surgical, no leak", async () => {
+  it("once read, a confirmed session start evicts it, but a vetoable switch does not", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
     const id = await spawnCompletedBackgroundAgent(tools);
@@ -164,9 +164,13 @@ describe("issue #108: unread completed background agents survive session events"
     const first = await tools.get("get_subagent_result").execute("tc-read1", { agent_id: id }, undefined, undefined, ctx());
     expect(textOf(first)).toContain("THE-RESULT-PAYLOAD");
 
-    // Now a session switch SHOULD clean it up (consumed records are not preserved).
-    await lifecycle.get("session_before_switch")?.();
+    // A before-switch may be vetoed, so it cannot destroy the live record.
+    await lifecycle.get("session_before_switch")?.({ type: "session_before_switch", reason: "new" }, ctx());
+    const stillHere = await tools.get("get_subagent_result").execute("tc-before", { agent_id: id }, undefined, undefined, ctx());
+    expect(textOf(stillHere)).toContain("THE-RESULT-PAYLOAD");
 
+    // Once the new session starts, consumed records are no longer preserved.
+    await lifecycle.get("session_start")?.({ type: "session_start", reason: "new" }, ctx());
     const second = await tools.get("get_subagent_result").execute("tc-read2", { agent_id: id }, undefined, undefined, ctx());
     expect(textOf(second)).toContain("Agent not found");
 

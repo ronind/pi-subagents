@@ -120,6 +120,9 @@ describe("cost display", () => {
   });
 
   describe("the background completion notification the model reads", () => {
+    const startIdleSession = (lifecycle: ReturnType<typeof boot>["lifecycle"]) =>
+      lifecycle.get("session_start")({ type: "session_start" }, ctx({ isIdle: () => true }));
+
     /**
      * The <task-notification> text sent into the parent conversation. Held
      * behind a 200ms nudge debounce (plus batch finalization), so this polls
@@ -140,7 +143,8 @@ describe("cost display", () => {
       );
 
     it("includes the cost in the usage block when enabled", async () => {
-      const { pi, tools } = boot({ showCost: true, defaultJoinMode: "async" });
+      const { pi, tools, lifecycle } = boot({ showCost: true, defaultJoinMode: "async" });
+      await startIdleSession(lifecycle);
       runSpending(COST);
 
       await spawnBackground(tools);
@@ -152,7 +156,8 @@ describe("cost display", () => {
       // A figure the orchestrator was not asked to track is one it may start
       // reporting unprompted, so the setting gates the context too, not just
       // what a human sees.
-      const { pi, tools } = boot({ showCost: false, defaultJoinMode: "async" });
+      const { pi, tools, lifecycle } = boot({ showCost: false, defaultJoinMode: "async" });
+      await startIdleSession(lifecycle);
       runSpending(COST);
 
       await spawnBackground(tools);
@@ -163,7 +168,8 @@ describe("cost display", () => {
     });
 
     it("omits it for a model with no pricing data", async () => {
-      const { pi, tools } = boot({ showCost: true, defaultJoinMode: "async" });
+      const { pi, tools, lifecycle } = boot({ showCost: true, defaultJoinMode: "async" });
+      await startIdleSession(lifecycle);
       runSpending(0);
 
       await spawnBackground(tools);

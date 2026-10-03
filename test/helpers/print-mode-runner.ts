@@ -53,6 +53,7 @@ import {
   fauxAssistantMessage,
   fauxText,
   fauxToolCall,
+  getCurrentTools,
   type Model,
   type ToolCall,
 } from "@earendil-works/pi-ai";
@@ -198,7 +199,7 @@ function resolveReply(
 /**
  * The common single-spawn flow as a responder. Routes by inspecting the calling
  * session's own context:
- *   - PARENT  (its tool set includes `Agent`):
+ *   - PARENT  (its transcript's current tool set includes `Agent`):
  *       · `parentInitial` until an `Agent` tool result is in history (the spawn),
  *       · then `parentFinal` (the answer after the child reports back).
  *   - SUBAGENT (no `Agent` tool): `subagent`.
@@ -210,7 +211,7 @@ export function routeBySession(routes: {
   subagent: FauxReply | ((ctx: Context) => FauxReply);
 }): FauxResponder {
   return (context) => {
-    const isParent = (context.tools ?? []).some((t) => t.name === "Agent");
+    const isParent = getCurrentTools(context.messages).some((t) => t.name === "Agent");
     if (!isParent) return resolveReply(routes.subagent, context);
     const spawned = context.messages.some(
       (m) => m.role === "toolResult" && (m as { toolName?: string }).toolName === "Agent",

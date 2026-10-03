@@ -1,5 +1,14 @@
 # @tintinweb/pi-subagents
 
+## Rōnin fork
+
+This fork ports Per Appelgren's completion-notification fix from
+[upstream PR #353](https://github.com/tintinweb/pi-subagents/pull/353)
+(commits `3a24a4f` and `5688359`) and validates it against Pi 1.0.0.
+It retains upstream's tools and settings. The changes keep background
+notifications retractable while the parent works, suppress already-consumed
+results, and prevent older resume generations from notifying as a newer run.
+
 A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-agents and workflow orchestration** to pi. Spawn specialized agents that run in isolated sessions — each with its own tools, system prompt, model, and thinking level. Run them in the background (the default) or block on them, steer them mid-run, resume completed sessions, and define your own custom agent types. When the orchestration shouldn't be improvised, hand a deterministic JavaScript script to the `SubagentWorkflow` tool — `agent()`, `parallel()`, `pipeline()` — and scripts written for Claude Code's `Workflow` tool run here unchanged.
 
 <img width="600" alt="pi-subagents screenshot" src="https://github.com/tintinweb/pi-subagents/raw/master/media/screenshot.png" />
@@ -49,7 +58,10 @@ Or load directly for development:
 pi -e ./src/index.ts
 ```
 
-Requires pi **0.84.0 or newer**: the [`SubagentWorkflow`](#subagentworkflow) tool builds on `constrainedSampling` (pi 0.82.0) and pi-tui's `stripTerminalSequences` (0.84.0). The `peerDependencies` range declares it, so npm flags an older pi at install time.
+Requires pi **0.87.1 or newer**: completion delivery uses the actionable
+`agent_before_settle` hook. Development dependencies are pinned to Pi 1.0.0;
+CI also checks the minimum supported version. Upgrade older hosts before
+installing this fork.
 
 ### Other hosts
 
@@ -582,6 +594,18 @@ When background agents complete, they notify the main agent. The **join mode** c
 
 **Timeout behavior:** When agents are grouped, a 30-second timeout starts after the first agent completes. If not all agents finish in time, a partial notification is sent with completed results and remaining agents continue with a shorter 15-second re-batch window for stragglers.
 
+**Delivery boundary:** While the parent is busy, completed results stay in a
+local queue. Before a successful run settles, the extension checks consumption
+again and passes only unread results to the model. Idle parents keep the 200 ms
+hold. Retrieving a completed result through `get_subagent_result` (including by
+handle) or RPC consume suppresses it while it is still held locally.
+
+This does not wait for children still running when a one-shot CLI settles;
+join those explicitly. Already-enqueued Pi messages cannot be withdrawn. A
+completion parked before an aborted or failed parent run remains pending until
+a subsequent successful boundary; session shutdown drops pending notifications.
+Workflow completion delivery is unchanged.
+
 **Configuration:**
 - Configure join mode in `/agents` → Settings → Join mode
 
@@ -953,6 +977,7 @@ src/
   child-context.ts    # AsyncLocalStorage flag marking work done for a child session
   abortable.ts        # Race a wait against Esc without cancelling the background child
   group-join.ts       # Group join manager: batched completion notifications with timeout
+  completion-nudge-queue.ts # Retractable completions and final-boundary delivery
   status-note.ts      # Honest status note + salvaged partial output for non-normal outcomes
   usage.ts            # Token usage shapes, accumulators, session-stats readers
 

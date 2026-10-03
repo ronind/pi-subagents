@@ -13,7 +13,8 @@ export type DeliveryCallback = (records: AgentRecord[], partial: boolean) => voi
 interface AgentGroup {
   groupId: string;
   agentIds: Set<string>;
-  completedRecords: Map<string, AgentRecord>;
+  /** Keep the live record for consumption, but pin the run at first completion. */
+  completedRecords: Map<string, { record: AgentRecord; generation: number | undefined }>;
   timeoutHandle?: ReturnType<typeof setTimeout>;
   delivered: boolean;
   /** Shorter timeout for stragglers after a partial delivery. */
@@ -63,7 +64,12 @@ export class GroupJoinManager {
     const group = this.groups.get(groupId);
     if (!group || group.delivered) return 'pass';
 
-    group.completedRecords.set(record.id, record);
+    const completed = group.completedRecords.get(record.id);
+    // The same AgentRecord can complete again after resume while its previous
+    // run is still held here. Let the new run notify independently; replacing
+    // the old entry would make the old group claim the resumed completion.
+    if (completed && completed.generation !== record.generation) return 'pass';
+    group.completedRecords.set(record.id, { record, generation: record.generation });
 
     // All done — deliver immediately
     if (group.completedRecords.size >= group.agentIds.size) {
@@ -94,11 +100,13 @@ export class GroupJoinManager {
 
     // Clean up agentToGroup for delivered agents (they won't complete again)
     for (const id of group.completedRecords.keys()) {
-      this.agentToGroup.delete(id);
+      if (this.agentToGroup.get(id) === group.groupId) this.agentToGroup.delete(id);
     }
 
-    // Deliver what we have
-    this.deliverCb([...group.completedRecords.values()], true);
+    // Deliver only runs still current. The record itself stays live, so the
+    // notification callback can still check resultConsumed at send time.
+    const records = this.currentRecords(group);
+    if (records.length > 0) this.deliverCb(records, true);
 
     // Set up straggler group for remaining agents
     group.completedRecords.clear();
@@ -113,15 +121,22 @@ export class GroupJoinManager {
       group.timeoutHandle = undefined;
     }
     group.delivered = true;
-    this.deliverCb([...group.completedRecords.values()], partial);
+    const records = this.currentRecords(group);
+    if (records.length > 0) this.deliverCb(records, partial);
     this.cleanupGroup(group.groupId);
+  }
+
+  private currentRecords(group: AgentGroup): AgentRecord[] {
+    return [...group.completedRecords.values()]
+      .filter(({ record, generation }) => record.generation === generation)
+      .map(({ record }) => record);
   }
 
   private cleanupGroup(groupId: string): void {
     const group = this.groups.get(groupId);
     if (!group) return;
     for (const id of group.agentIds) {
-      this.agentToGroup.delete(id);
+      if (this.agentToGroup.get(id) === groupId) this.agentToGroup.delete(id);
     }
     this.groups.delete(groupId);
   }

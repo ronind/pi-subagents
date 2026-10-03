@@ -33,6 +33,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Usage } from "@earendil-works/pi-ai";
 import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PendingUsagePool } from "../../src/usage.js";
@@ -72,7 +73,7 @@ describe("subagent usage reaches the parent session's stats (real pi)", () => {
   }
 
   /** The tool result our `Agent` tool returns, as pi would persist it. */
-  function toolResultCarrying(usage: unknown) {
+  function toolResultCarrying(usage: Usage | undefined) {
     return {
       role: "toolResult" as const,
       toolCallId: "tc-1",
@@ -114,22 +115,23 @@ describe("subagent usage reaches the parent session's stats (real pi)", () => {
     }
   });
 
-  it("leaves the context-window percentage alone", async () => {
-    // pi derives context usage from assistant messages only. If that ever
-    // changed, a delegating session would look like it was filling its context
-    // with work that happened somewhere else entirely — and users would compact
-    // for no reason.
+  it("does not count reported child usage toward the parent's context window", async () => {
+    // Modern Pi estimates the result text's context cost even without a model
+    // turn. Compare identical result text with/without billing metadata: the
+    // child's 150k tokens must not inflate the parent's context estimate.
     const session = await realSession();
+    const control = await realSession();
     try {
-      const before = session.getSessionStats().contextUsage?.percent ?? null;
-
+      control.sessionManager.appendMessage(toolResultCarrying(undefined));
       const pool = new PendingUsagePool();
       pool.add({ input: 150_000, output: 400, cacheWrite: 100, cost: 1.5 });
-      session.sessionManager.appendMessage(toolResultCarrying(pool.drain()) as any);
+      session.sessionManager.appendMessage(toolResultCarrying(pool.drain()));
 
-      expect(session.getSessionStats().contextUsage?.percent ?? null).toBe(before);
+      expect(session.getSessionStats().contextUsage?.percent ?? null)
+        .toBe(control.getSessionStats().contextUsage?.percent ?? null);
     } finally {
       session.dispose?.();
+      control.dispose?.();
     }
   });
 

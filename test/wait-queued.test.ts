@@ -50,6 +50,7 @@ function ctx() {
     modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
     sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
+    isIdle: () => true,
   } as any;
 }
 
@@ -94,6 +95,7 @@ describe("get_subagent_result wait:true on a queued agent", () => {
   it("waits through queue start and returns the result (no 'still running')", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
+    await lifecycle.get("agent_start")?.({ type: "agent_start" }, ctx());
 
     const resolvers = deferredRuns();
 
@@ -132,6 +134,7 @@ describe("get_subagent_result wait:true on a queued agent", () => {
   it("aborts a running result wait without aborting or consuming the child", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
+    await lifecycle.get("agent_start")?.({ type: "agent_start" }, ctx());
 
     let resolveRun: (() => void) | undefined;
     let childSignal: AbortSignal | undefined;
@@ -187,6 +190,7 @@ describe("get_subagent_result wait:true on a queued agent", () => {
   it("aborts a queued result wait before the agent starts", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
+    await lifecycle.get("agent_start")?.({ type: "agent_start" }, ctx());
 
     const resolvers = deferredRuns();
     let queuedId: string | undefined;

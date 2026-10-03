@@ -63,7 +63,7 @@ function makePi() {
   return { pi, lifecycle, bus };
 }
 
-function ctx() {
+function ctx(isIdle: () => boolean = () => true) {
   return {
     hasUI: false,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn(), addAutocompleteProvider: vi.fn() },
@@ -72,6 +72,7 @@ function ctx() {
     modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
     sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
+    isIdle: vi.fn(isIdle),
   } as any;
 }
 
@@ -117,10 +118,10 @@ describe("subagents:rpc:consume", () => {
   });
 
   /** Boot the real extension with its RPC handlers bound, as session_start does. */
-  async function boot() {
+  async function boot(context = ctx()) {
     const booted = makePi();
     subagentsExtension(booted.pi);
-    await booted.lifecycle.get("session_start")({}, ctx());
+    await booted.lifecycle.get("session_start")({}, context);
     shutdown = () => booted.lifecycle.get("session_shutdown")();
     return booted;
   }
@@ -163,6 +164,33 @@ describe("subagents:rpc:consume", () => {
     await spawnOverRpc(bus, "req-spawn-2");
     await new Promise(r => setTimeout(r, PAST_THE_HOLD_MS));
 
+    expect(notifications(pi)).toEqual([]);
+  });
+
+  it.each([true, false])("re-checks late RPC consumption at settle (consumed=%s)", async consumed => {
+    let idle = false;
+    const context = ctx(() => idle);
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "LATE_RPC_RESULT" });
+    const { pi, bus, lifecycle } = await boot(context);
+    const id = await spawnOverRpc(bus, "late-spawn");
+    await new Promise(resolve => setTimeout(resolve, PAST_THE_HOLD_MS));
+    expect(notifications(pi)).toEqual([]);
+
+    if (consumed) {
+      const reply = vi.fn();
+      bus.on("subagents:rpc:consume:reply:late-consume", reply);
+      bus.emit("subagents:rpc:consume", { requestId: "late-consume", agentId: id });
+      await vi.waitFor(() => expect(reply).toHaveBeenCalledWith({ success: true }));
+    }
+    const settled = await lifecycle.get("agent_before_settle")({
+      type: "agent_before_settle", outcome: "completed", entries: [], continue: false,
+    }, context);
+    expect(settled?.entries ?? []).toHaveLength(consumed ? 0 : 1);
+    if (!consumed) {
+      expect(settled.continue).toBe(true);
+      expect(settled.entries[0].content).toContain(id);
+    }
+    idle = true;
     expect(notifications(pi)).toEqual([]);
   });
 

@@ -111,17 +111,25 @@ The same predicate silently scopes the events. **Every lifecycle event is top-le
 
 When a background agent finishes, pi-subagents sends the user a completion notification. If you have already shown the model that result yourself, that notification arrives on top of an answer that was already given, and it costs the parent a turn to dismiss. `subagents:rpc:consume` is how you say you have handled it — the bus-side half of what `get_subagent_result` does when it returns a result.
 
-**When you send it decides whether it works.** The timeline:
+**Consumption is checked at delivery, not just completion.** The timeline:
 
-1. The agent settles and `subagents:completed` is emitted — `src/index.ts:581`.
-2. Eleven lines later, at `src/index.ts:592`, the code checks `record.resultConsumed` and decides whether to notify at all.
-3. `pi.events` dispatch is synchronous and in-process, so a handler that emits `subagents:rpc:consume` **without awaiting anything** has already set that flag before step 2 evaluates.
+1. The agent settles and `subagents:completed` is emitted.
+2. An unconsumed completion is held in the extension's local queue.
+3. If the parent is idle, delivery keeps the 200 ms hold. If busy, the extension
+   drains unread results at `agent_before_settle`, before a successful run ends.
+4. Both paths re-check consumption and the completed run's generation. Groups
+   exclude each consumed or superseded member separately.
 
 | When you consume | What happens |
 |---|---|
-| Synchronously, inside your `subagents:completed` handler | The notification is never scheduled. This is the clean path |
-| After an `await`, within 200 ms | Still suppressed. The nudge is held for `NUDGE_HOLD_MS` (`src/index.ts:451`), `consume` cancels the pending timer (`:819`), and there is a re-check at send time (`:474`) |
-| After 200 ms | Too late. The follow-up has fired with `triggerTurn: true` and cost the parent a turn |
+| Synchronously, inside your `subagents:completed` handler | The notification is never scheduled |
+| While the notification is held locally, including after 200 ms during a busy parent run | Suppressed at delivery; cancellation also resolves handles to their canonical agent ID |
+| After the message has been handed to Pi | Too late: Pi's queued message cannot be withdrawn |
+
+An aborted or failed parent boundary does not drain parked notifications. They
+remain pending for a subsequent successful boundary; session shutdown drops
+pending delivery. A child that finishes after the parent is idle uses the normal
+idle path. This does not keep one-shot CLI processes alive for running children.
 
 Fire-and-forget is the intended use: the reply carries nothing to act on, and the channel sits outside the `subagents:rpc:ping` version handshake on purpose (`src/cross-extension-rpc.ts:190`), so you can send it unconditionally and an older pi-subagents with no handler simply keeps notifying.
 

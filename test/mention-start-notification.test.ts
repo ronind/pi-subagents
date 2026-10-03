@@ -61,6 +61,7 @@ const send = (lifecycle: Map<string, any>, text: string) =>
 describe("an agent started by a mention", () => {
   it("relays its answer through the ordinary completion notification (direct mode)", async () => {
     const { pi, lifecycle } = boot({ agentMentions: "direct" });
+    await lifecycle.get("session_start")({ type: "session_start" }, ctx({ isIdle: () => true }));
     vi.mocked(runAgent).mockResolvedValue({
       responseText: "found four planted bugs",
       session: fakeSession(),
@@ -85,6 +86,7 @@ describe("an agent started by a mention", () => {
     // What the user hits today: the clone reports it could not start the agent,
     // index.ts starts it directly, and the answer still has to come back.
     const { pi, lifecycle } = boot();
+    await lifecycle.get("session_start")({ type: "session_start" }, ctx({ isIdle: () => true }));
     vi.mocked(runMentionClone).mockResolvedValue({ spawned: false, error: "the conversation clone did not start it" });
     vi.mocked(runAgent).mockResolvedValue({
       responseText: "cyan, obviously",

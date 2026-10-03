@@ -12,7 +12,7 @@
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { type CustomMessageEntryDraft, defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
@@ -22,6 +22,7 @@ import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
+import { CompletionNudgeQueue } from "./completion-nudge-queue.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { GroupJoinManager } from "./group-join.js";
@@ -444,13 +445,17 @@ export default function (pi: ExtensionAPI) {
   }
   const pendingUsage = new PendingUsagePool();
 
-  // ---- Cancellable pending notifications ----
-  // Holds notifications briefly so get_subagent_result can cancel them
-  // before they reach pi.sendMessage (fire-and-forget).
+  // Keep individual and grouped completions retractable while the parent runs.
+  // At the final actionable boundary they become custom-message entries, not
+  // post-settle timers (which CLI shutdown can cancel before they are delivered).
+  const completionNudges = new CompletionNudgeQueue(
+    () => currentCtx?.isIdle() ?? false,
+    message => pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: true }),
+  );
+  // Workflow completions have no result-consumption path. Keep their existing
+  // timer delivery (including stopped-workflow reporting) separate from agents.
   const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
   const NUDGE_HOLD_MS = 200;
-  // A queued result wait must observe completion before its held notification
-  // can fire, so successful waits can still suppress that redundant nudge.
   const QUEUE_WAIT_POLL_MS = Math.floor(NUDGE_HOLD_MS / 4);
 
   function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
@@ -462,6 +467,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function cancelNudge(key: string) {
+    completionNudges.cancel(key);
     const timer = pendingNudges.get(key);
     if (timer != null) {
       clearTimeout(timer);
@@ -469,26 +475,36 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  pi.on("agent_start", (_event, ctx) => { currentCtx = ctx; });
+  pi.on("agent_before_settle", async (event, ctx) => {
+    if (event.outcome !== "completed" || ctx.signal?.aborted) return;
+    const entries = await completionNudges.drainBeforeSettle(ctx.signal);
+    if (entries.length === 0 || ctx.signal?.aborted) return;
+    return { entries: [...event.entries, ...entries], continue: true };
+  });
+
   // ---- Individual nudge helper (async join mode) ----
-  function emitIndividualNudge(record: AgentRecord) {
-    if (record.resultConsumed) return;  // re-check at send time
+  function buildIndividualNudge(record: AgentRecord, generation: number | undefined): CustomMessageEntryDraft | undefined {
+    if (record.resultConsumed || record.generation !== generation) return;
 
     const notification = formatTaskNotification(record, 500, showCost);
     const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
 
-    pi.sendMessage<NotificationDetails>({
+    return {
+      type: "custom_message",
       customType: "subagent-notification",
       content: notification + footer,
       display: true,
       details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
-    }, { deliverAs: "followUp", triggerTurn: true });
+    };
   }
 
   function sendIndividualNudge(record: AgentRecord) {
     agentActivity.delete(record.id);
     widget.markFinished(record.id);
     fleet.onAgentFinished(record.id);
-    scheduleNudge(record.id, () => emitIndividualNudge(record));
+    const generation = record.generation;
+    completionNudges.schedule(record.id, () => buildIndividualNudge(record, generation), NUDGE_HOLD_MS);
     widget.update();
   }
 
@@ -498,9 +514,13 @@ export default function (pi: ExtensionAPI) {
       for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); fleet.onAgentFinished(r.id); }
 
       const groupKey = `group:${records.map(r => r.id).join(",")}`;
-      scheduleNudge(groupKey, () => {
-        // Re-check at send time
-        const unconsumed = records.filter(r => !r.resultConsumed);
+      // The group holds mutable AgentRecords. A resume can clear resultConsumed
+      // before this closure sends, so pin each member to the run that finished.
+      const completed = records.map(record => ({ record, generation: record.generation }));
+      completionNudges.schedule(groupKey, () => {
+        const unconsumed = completed
+          .filter(({ record, generation }) => !record.resultConsumed && record.generation === generation)
+          .map(({ record }) => record);
         if (unconsumed.length === 0) { widget.update(); return; }
 
         const notifications = unconsumed.map(r => formatTaskNotification(r, 300, showCost)).join('\n\n');
@@ -514,13 +534,14 @@ export default function (pi: ExtensionAPI) {
           details.others = rest.map(r => buildNotificationDetails(r, 300, agentActivity.get(r.id)));
         }
 
-        pi.sendMessage<NotificationDetails>({
+        return {
+          type: "custom_message",
           customType: "subagent-notification",
           content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
           display: true,
           details,
-        }, { deliverAs: "followUp", triggerTurn: true });
-      });
+        };
+      }, NUDGE_HOLD_MS);
       widget.update();
     },
     30_000,
@@ -1087,14 +1108,13 @@ export default function (pi: ExtensionAPI) {
     return { action: "handled" };
   });
 
-  pi.on("session_before_switch", () => {
-    manager.clearCompleted(true);
-    scheduler.stop();
-  });
-
   // On shutdown, abort all agents immediately and clean up.
-  // If the session is going down, there's nothing left to consume agent results.
+  // CLI completions already present at the final boundary are delivered before
+  // this hook; still-running children are outside that boundary's snapshot.
   pi.on("session_shutdown", async () => {
+    // Dispose before abortAll: abort callbacks must not enqueue fresh nudges.
+    completionNudges.dispose();
+    groupJoin.dispose();
     rpcHandle?.unsubSpawn();
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
@@ -2801,7 +2821,7 @@ Terse command-style prompts produce shallow, generic work.
       // Mark result as consumed — suppresses the completion notification
       if (record.status !== "running" && record.status !== "queued") {
         record.resultConsumed = true;
-        cancelNudge(params.agent_id);
+        cancelNudge(record.id);
       }
 
       // Verbose: include full conversation

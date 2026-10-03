@@ -198,6 +198,8 @@ export interface AgentRecord {
   startGate?: Promise<void>;
   groupId?: string;
   joinMode?: JoinMode;
+  /** Run identity: incremented when a resume is accepted, even if it waits in a queue. */
+  generation?: number;
   /** Set when result was already consumed via get_subagent_result — suppresses completion notification. */
   resultConsumed?: boolean;
   /** Steering messages queued before the session was ready. */

@@ -18,8 +18,8 @@
  *      the one that puts `Agent ID: ...` in the text.
  *
  * Together: whatever id the reporter's model passed, it wasn't one we issued,
- * and "not found" was the correct answer. Test 3 pins the eviction rule that
- * DOES apply, so the two are not confused again.
+ * and "not found" was the correct answer. The final test pins the eviction
+ * rule after confirmed session start, so the two are not confused again.
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -205,16 +205,18 @@ describe("issue #174: foreground agent that hits max_turns", () => {
     await parent.lifecycle.get("session_shutdown")?.({}, ctx());
   });
 
-  it("IS evicted by a session switch — its result was already delivered inline", async () => {
+  it("is evicted on confirmed session start, not on a vetoable switch", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
     const { id } = await runForegroundSteeredAgent(tools);
 
-    // Foreground results count as consumed the moment they're returned inline,
-    // so clearCompleted(true)'s #108 preservation deliberately does not cover
-    // them. This is the ONLY path that makes a foreground id stop resolving.
-    await lifecycle.get("session_before_switch")?.();
+    // Foreground results are consumed inline. A before-switch can be vetoed,
+    // and must not evict the record; confirmed session_start may clear it.
+    await lifecycle.get("session_before_switch")?.({ type: "session_before_switch", reason: "new" }, ctx());
+    const before = await tools.get("get_subagent_result").execute("tc-before", { agent_id: id }, undefined, undefined, ctx());
+    expect(textOf(before)).toContain("THE-RESULT-PAYLOAD");
 
+    await lifecycle.get("session_start")?.({ type: "session_start", reason: "new" }, ctx());
     const read = await tools.get("get_subagent_result").execute("tc-read", { agent_id: id }, undefined, undefined, ctx());
     expect(textOf(read)).toContain("Agent not found");
 
