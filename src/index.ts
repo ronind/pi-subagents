@@ -62,7 +62,7 @@ import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { selectItem } from "./ui/select-item.js";
 import { renderWorkflowCard, renderWorkflowEntryCard } from "./ui/workflow-card.js";
 import { openWorkflowFromFleet, showWorkflowsMenu, type WorkflowMenuDeps } from "./ui/workflow-menu.js";
-import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, PendingUsagePool, toReportedUsage } from "./usage.js";
+import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, PendingUsagePool, type ReportedUsage, toReportedUsage } from "./usage.js";
 import { decideWorkflowCollision, FOREIGN_WORKFLOW_TOOL_NAMES } from "./workflow/collisions.js";
 import { WORKFLOW_ENTRY_TYPE, type WorkflowEntryData, workflowEntryData } from "./workflow/entry.js";
 import { createWorkflowHost } from "./workflow/host.js";
@@ -445,6 +445,21 @@ export default function (pi: ExtensionAPI) {
   }
   const pendingUsage = new PendingUsagePool();
 
+  // ExtensionContext exposes a read-only SessionManager type, but Pi >=0.87.1
+  // supplies this runtime capability. The pool has no per-model attribution.
+  type UsageSessionManager = {
+    appendUsage(kind: "subagent", provider: string, model: string, usage: ReportedUsage, note?: string): unknown;
+  };
+  function flushPendingUsage(ctx: ExtensionContext): void {
+    if (!reportUsage) return;
+    const sessionManager = ctx.sessionManager as unknown as Partial<UsageSessionManager>;
+    if (typeof sessionManager.appendUsage !== "function") return;
+    const usage = pendingUsage.drain();
+    if (!usage) return;
+    sessionManager.appendUsage("subagent", "pi-subagents", "aggregate", usage,
+      "Aggregate subagent usage not reported by tool results");
+  }
+
   // Keep individual and grouped completions retractable while the parent runs.
   // At the final actionable boundary they become custom-message entries, not
   // post-settle timers (which CLI shutdown can cancel before they are delivered).
@@ -482,6 +497,9 @@ export default function (pi: ExtensionAPI) {
     if (entries.length === 0 || ctx.signal?.aborted) return;
     return { entries: [...event.entries, ...entries], continue: true };
   });
+
+  // Final only: draining during foreground execution would steal tool usage.
+  pi.on("agent_settled", (_event, ctx) => { flushPendingUsage(ctx); });
 
   // ---- Individual nudge helper (async join mode) ----
   function buildIndividualNudge(record: AgentRecord, generation: number | undefined): CustomMessageEntryDraft | undefined {
@@ -1111,7 +1129,7 @@ export default function (pi: ExtensionAPI) {
   // On shutdown, abort all agents immediately and clean up.
   // CLI completions already present at the final boundary are delivered before
   // this hook; still-running children are outside that boundary's snapshot.
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (_event, ctx) => {
     // Dispose before abortAll: abort callbacks must not enqueue fresh nudges.
     completionNudges.dispose();
     groupJoin.dispose();
@@ -1131,15 +1149,32 @@ export default function (pi: ExtensionAPI) {
     // as well as its children, and only its own signal terminates that.
     for (const task of workflowTasks.values()) task.abortController.abort();
     workflowTasks.clear();
+    const pendingRuns = reportUsage
+      ? manager.listAgents().flatMap(record => record.promise ? [record.promise] : [])
+      : [];
     manager.abortAll();
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
     fleet.dispose();
+    // Keep accounting listeners attached while cancelled runs finalize usage.
+    // A provider ignoring cancellation must not prevent the user from quitting.
+    if (pendingRuns.length > 0) {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          Promise.allSettled(pendingRuns),
+          new Promise<void>(resolve => { timeout = setTimeout(resolve, 2000); }),
+        ]);
+      } finally {
+        if (timeout !== undefined) clearTimeout(timeout);
+      }
+    }
     // Awaited: it emits `session_shutdown` into every retained child session so
     // extensions bound there can release what they armed in `session_start` (#242).
     // pi awaits this handler, and the process exits right after — unawaited, those
     // handlers would never run. Internally bounded, so a hung one can't strand quit.
     await manager.dispose(pi);
+    flushPendingUsage(ctx);
   });
 
   // Live widget: show running agents above editor.
@@ -2293,7 +2328,7 @@ Terse command-style prompts produce shallow, generic work.
    *
    * Pi copies `AgentToolResult.usage` onto the persisted tool-result message and
    * folds it into `getSessionStats()`, which is what the footer, the statusline
-   * and `/cost` read — so this is the whole of "report usage to the parent".
+   * and `/cost` read. Settlement and shutdown persist any remainder separately.
    *
    * Nothing is attached to a call with no tool-call id. That is the `@handle`
    * mention path (`mention-clone.ts`), which invokes this tool from a fork of the
@@ -3641,7 +3676,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
           id: "reportUsage",
           label: "Report usage to session",
           description:
-            "Add subagent tokens and cost to this session's own totals, so pi's footer and /cost stop reading a delegating session as nearly free. Reported on the next tool result (agents that finish in the background are counted on the one after). Context-window % is unaffected.",
+            "Add subagent tokens and cost to this session's own totals, so pi's footer and /cost stop reading a delegating session as nearly free. Reported on the next tool result, with any remainder counted at final settlement or shutdown. Context-window % is unaffected.",
           currentValue: isReportUsageEnabled() ? "on" : "off",
           values: ["on", "off"],
         },

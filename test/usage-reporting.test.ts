@@ -261,6 +261,152 @@ describe("reporting subagent usage back to the parent session", () => {
     expect(result.usage.cost.total).toBe(0.002);
   });
 
+  describe("usage left without a tool result", () => {
+    const spend = { input: 100, output: 50, cacheWrite: 10, cacheRead: 900, cost: 0.0123 };
+
+    function accountingContext() {
+      const appendUsage = vi.fn();
+      const context = ctx({
+        isIdle: () => false,
+        sessionManager: { getSessionId: () => "s1", getBranch: () => [], appendUsage },
+      });
+      return { context, appendUsage };
+    }
+
+    it("counts a busy completion after its preview and summary, without fetching the result", async () => {
+      const { lifecycle } = boot({ reportUsage: true });
+      const { context, appendUsage } = accountingContext();
+      await lifecycle.get("agent_start")({}, context);
+      runSpending(spend);
+      const registry = Reflect.get(globalThis, Symbol.for("pi-subagents:manager"));
+      registry.spawn(makePi().pi, context, "general-purpose", "go", { isBackground: true, description: "spend" });
+      await registry.waitForAll();
+      await flush();
+
+      const boundary = await lifecycle.get("agent_before_settle")({ outcome: "completed", entries: [] }, context);
+      expect(boundary.entries[0].content).toContain("<task-notification>");
+      expect(appendUsage).not.toHaveBeenCalled();
+      await lifecycle.get("agent_settled")?.({ outcome: "completed" }, context);
+      expect(appendUsage).toHaveBeenCalledExactlyOnceWith(
+        "subagent", "pi-subagents", "aggregate", expect.objectContaining({ totalTokens: 1060 }),
+        "Aggregate subagent usage not reported by tool results",
+      );
+      await lifecycle.get("agent_settled")?.({ outcome: "completed" }, context);
+      await lifecycle.get("session_shutdown")({}, context);
+      expect(appendUsage).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["completed", "aborted", "error"])("counts remaining usage on %s settlement", async outcome => {
+      const { tools, lifecycle } = boot({ reportUsage: true });
+      const { context, appendUsage } = accountingContext();
+      runSpending(spend);
+      await spawn(tools, undefined);
+      await lifecycle.get("agent_settled")?.({ outcome }, context);
+      expect(appendUsage).toHaveBeenCalledTimes(1);
+      expect(appendUsage.mock.calls[0][3].cost.total).toBe(0.0123);
+      await lifecycle.get("session_shutdown")({}, context);
+      expect(appendUsage).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["foreground", "result fetch"])("does not count %s usage again at settle or shutdown", async path => {
+      const { tools, lifecycle } = boot({ reportUsage: true });
+      const { context, appendUsage } = accountingContext();
+      runSpending(spend);
+      const first = await spawn(tools, path === "foreground" ? "tc-1" : undefined);
+      const result = path === "foreground" ? first : await tools.get("get_subagent_result").execute(
+        "tc-2", { agent_id: "nope" }, undefined, undefined, context,
+      );
+      expect(result.usage.totalTokens).toBe(1060);
+      await lifecycle.get("agent_settled")?.({ outcome: "completed" }, context);
+      await lifecycle.get("session_shutdown")({}, context);
+      expect(appendUsage).not.toHaveBeenCalled();
+    });
+
+    it("flushes the shutdown remainder after child teardown", async () => {
+      const { tools, lifecycle } = boot({ reportUsage: true });
+      const { context, appendUsage } = accountingContext();
+      const disposed = vi.fn();
+      vi.mocked(runAgent).mockImplementation(async (_c, _t, _p, opts) => {
+        opts.onAssistantUsage?.(spend);
+        return {
+          responseText: "done", aborted: false, steered: false,
+          session: {
+            messages: [],
+            dispose: () => {
+              opts.onAssistantUsage?.({ input: 7, output: 3, cacheWrite: 0, cost: 0.002 });
+              disposed();
+            },
+          } as never,
+        };
+      });
+      appendUsage.mockImplementation(() => expect(disposed).toHaveBeenCalled());
+      await spawn(tools, undefined);
+      await lifecycle.get("session_shutdown")({}, context);
+      expect(appendUsage).toHaveBeenCalledTimes(1);
+      expect(appendUsage.mock.calls[0][3].totalTokens).toBe(1070);
+      expect(appendUsage.mock.calls[0][3].cost.total).toBeCloseTo(0.0143);
+    });
+
+    it("waits for a cancelled running child to report its final asynchronous usage", async () => {
+      const { tools, lifecycle } = boot({ reportUsage: true });
+      const { context, appendUsage } = accountingContext();
+      vi.mocked(runAgent).mockImplementation((_c, _t, _p, opts) => new Promise(resolve => {
+        opts.signal?.addEventListener("abort", () => {
+          setTimeout(() => {
+            opts.onAssistantUsage?.(spend);
+            resolve({ responseText: "cancelled", session: { dispose: vi.fn(), messages: [] } as never,
+              aborted: true, steered: false });
+          }, 10);
+        }, { once: true });
+      }));
+      await tools.get("Agent").execute("tc-1",
+        { prompt: "go", description: "spend", subagent_type: "general-purpose", run_in_background: true },
+        undefined, undefined, context);
+      await lifecycle.get("session_shutdown")({}, context);
+      expect(appendUsage).toHaveBeenCalledTimes(1);
+      expect(appendUsage.mock.calls[0][3].cost.total).toBe(0.0123);
+      expect(appendUsage.mock.calls[0][3].totalTokens).toBe(1060);
+    });
+
+    it("bounds shutdown when a provider ignores cancellation", async () => {
+      vi.useFakeTimers();
+      try {
+        const { tools, lifecycle } = boot({ reportUsage: true });
+        const { context } = accountingContext();
+        vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
+        await tools.get("Agent").execute("tc-1",
+          { prompt: "go", description: "stuck", subagent_type: "general-purpose", run_in_background: true },
+          undefined, undefined, context);
+        let done = false;
+        const shutdown = lifecycle.get("session_shutdown")({}, context).then(() => { done = true; });
+        await vi.advanceTimersByTimeAsync(1999);
+        expect(done).toBe(false);
+        await vi.advanceTimersByTimeAsync(1);
+        await shutdown;
+        expect(done).toBe(true);
+      } finally { vi.useRealTimers(); }
+    });
+
+    it("preserves the pool when the session manager lacks the usage capability", async () => {
+      const { tools, lifecycle } = boot({ reportUsage: true });
+      runSpending(spend);
+      await spawn(tools, undefined);
+      await lifecycle.get("agent_settled")?.({ outcome: "completed" }, ctx());
+      runSpendingNothing();
+      expect((await spawn(tools, "tc-2")).usage.totalTokens).toBe(1060);
+    });
+
+    it("keeps both fallback drains disabled when reportUsage is false", async () => {
+      const { tools, lifecycle } = boot({ reportUsage: false });
+      const { context, appendUsage } = accountingContext();
+      runSpending(spend);
+      await spawn(tools, undefined);
+      await lifecycle.get("agent_settled")?.({ outcome: "completed" }, context);
+      await lifecycle.get("session_shutdown")({}, context);
+      expect(appendUsage).not.toHaveBeenCalled();
+    });
+  });
+
   describe("the lifecycle event payload", () => {
     /** The payload `subagents:completed` was emitted with. */
     async function completedPayload(pi: any) {

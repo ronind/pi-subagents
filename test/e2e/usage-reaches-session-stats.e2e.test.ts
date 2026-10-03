@@ -30,15 +30,23 @@
  * on past it (the Workflow tool needs 0.84.0), so this no longer pins the range's
  * lower edge — it still pins the behaviour that made 0.80.x unsupportable.
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Usage } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, type Usage } from "@earendil-works/pi-ai";
 import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { runAgent } from "../../src/agent-runner.js";
+import subagentsExtension from "../../src/index.js";
 import { PendingUsagePool } from "../../src/usage.js";
+import { ctx, makePi } from "../helpers/boot-extension.js";
 import { fauxModelBackend } from "../helpers/faux-model-backend.js";
 import { registerFauxProvider } from "../helpers/pi-ai.js";
+
+vi.mock("../../src/agent-runner.js", async () => {
+  const actual = await vi.importActual<typeof import("../../src/agent-runner.js")>("../../src/agent-runner.js");
+  return { ...actual, runAgent: vi.fn() };
+});
 
 // Real pi session construction; a cold first run under full-suite CPU
 // contention can exceed vitest's 5s default.
@@ -47,23 +55,30 @@ vi.setConfig({ testTimeout: 30_000 });
 describe("subagent usage reaches the parent session's stats (real pi)", () => {
   let cwd: string;
   let faux: ReturnType<typeof registerFauxProvider>;
+  let previousCwd: string;
 
   beforeEach(() => {
     cwd = mkdtempSync(join(tmpdir(), "subagents-usage-e2e-"));
+    previousCwd = process.cwd();
+    vi.stubEnv("PI_CODING_AGENT_DIR", join(cwd, "agent"));
+    vi.stubEnv("PI_CONFIG_DIR", join(cwd, "config"));
     faux = registerFauxProvider({ provider: "faux", models: [{ id: "faux-1", contextWindow: 200_000 }] });
   });
   afterEach(() => {
     faux.unregister();
+    process.chdir(previousCwd);
+    vi.unstubAllEnvs();
+    Reflect.deleteProperty(globalThis, Symbol.for("pi-subagents:manager"));
     rmSync(cwd, { recursive: true, force: true });
   });
 
   /** A real session, in memory, on a faux model. */
-  async function realSession() {
+  async function realSession(sessionManager = SessionManager.inMemory(cwd)) {
     const model = faux.getModel();
     const backend = fauxModelBackend(model);
     const { session } = await createAgentSession({
       cwd,
-      sessionManager: SessionManager.inMemory(cwd),
+      sessionManager,
       model: model as any,
       modelRegistry: backend.modelRegistry,
       modelRuntime: backend.modelRuntime,
@@ -132,6 +147,58 @@ describe("subagent usage reaches the parent session's stats (real pi)", () => {
     } finally {
       session.dispose?.();
       control.dispose?.();
+    }
+  });
+
+  it("persists the extension's settled remainder with the same totals as a tool report and no context change", async () => {
+    process.chdir(cwd);
+    mkdirSync(join(cwd, ".pi"));
+    writeFileSync(join(cwd, ".pi", "subagents.json"), JSON.stringify({ reportUsage: true, outputTranscript: false }));
+    const manager = SessionManager.create(cwd, join(cwd, "sessions"));
+    const session = await realSession(manager);
+    const control = await realSession();
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    const context = ctx({ sessionManager: manager });
+    const spend = { input: 150_000, output: 400, cacheWrite: 100, cacheRead: 9000, cost: 1.5 };
+    const pool = new PendingUsagePool();
+    pool.add(spend);
+    const usage = pool.drain();
+    vi.mocked(runAgent).mockImplementation(async (_c, _t, _p, opts) => {
+      opts.onAssistantUsage?.(spend);
+      return { responseText: "done", session: { dispose: vi.fn(), messages: [] } as never, aborted: false, steered: false };
+    });
+    try {
+      // Seed both sessions so Pi writes their files and context is comparable.
+      const prompt = { role: "user" as const, content: "go", timestamp: 1 };
+      manager.appendMessage(prompt);
+      control.sessionManager.appendMessage(prompt);
+      const answer = fauxAssistantMessage("ready");
+      manager.appendMessage(answer);
+      control.sessionManager.appendMessage(answer);
+      manager.appendMessage(toolResultCarrying(undefined));
+      control.sessionManager.appendMessage(toolResultCarrying(usage));
+      const beforeContext = session.getSessionStats().contextUsage;
+      await tools.get("Agent").execute(undefined,
+        { prompt: "go", description: "spend", subagent_type: "general-purpose", run_in_background: false },
+        undefined, undefined, context);
+      await lifecycle.get("agent_settled")?.({ outcome: "completed" }, context);
+      await lifecycle.get("session_shutdown")({}, context);
+      expect(session.getSessionStats().tokens).toEqual(control.getSessionStats().tokens);
+      expect(session.getSessionStats().cost).toBe(control.getSessionStats().cost);
+      expect(session.getSessionStats().contextUsage).toEqual(beforeContext);
+      const reopened = SessionManager.open(manager.getSessionFile()!);
+      const entry = reopened.getEntries().find(e => e.type === "usage");
+      expect(entry).toMatchObject({ kind: "subagent", provider: "pi-subagents", model: "aggregate", usage });
+      expect(reopened.getEntries().filter(e => e.type === "usage")).toHaveLength(1);
+      const restored = await realSession(reopened);
+      try {
+        expect(restored.getSessionStats().tokens).toEqual(control.getSessionStats().tokens);
+        expect(restored.getSessionStats().cost).toBe(1.5);
+      } finally { restored.dispose(); }
+    } finally {
+      session.dispose();
+      control.dispose();
     }
   });
 

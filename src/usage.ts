@@ -100,7 +100,8 @@ export function toReportedUsage(u: LifetimeUsage): ReportedUsage | undefined {
  * to hang the spend on a tool result. Background and scheduled agents finish
  * between tool calls with nothing to hang it on, hence a pool: every assistant
  * message lands here as it happens, and the next tool result we return carries
- * whatever has accumulated.
+ * whatever has accumulated. Final settlement and shutdown persist any remainder
+ * as non-context usage when no tool result carried it.
  *
  * Drain empties it, so each message is reported exactly once no matter how many
  * results are returned or how many agents were running.
