@@ -21,7 +21,7 @@ jobs:
       - run: npm run test
       - run: npm run build
 
-  # The primary job validates the pinned Pi 1.0.0 baseline. The floor job checks
+  # The primary job validates the pinned Pi 1.0.2 baseline. The floor job checks
   # the earliest supported Pi: 0.87.1 introduced agent_before_settle, which keeps
   # completion notifications retractable until the final actionable boundary.
   compat-floor-pi:
@@ -43,7 +43,7 @@ jobs:
   # Forward canary: reinstall whatever Pi is `latest` over the pin, so a release newer than
   # the baseline surfaces here before it reaches users. It runs the full typecheck + suite,
   # not a hand-picked file list, so new drift can't hide in a test nobody remembered to add
-  # here. The pinned baseline is Pi 1.0.0.
+  # here. The pinned baseline is Pi 1.0.2.
   compat-latest-pi:
     runs-on: ubuntu-latest
     continue-on-error: true # current Pi is not a hard support guarantee; surface breakage without blocking

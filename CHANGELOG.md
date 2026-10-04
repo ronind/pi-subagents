@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **TypeBox uses Pi's host-provided modules.** Both TypeBox package names are peer dependencies rather than runtime dependencies, avoiding duplicate modules and Pi's startup warning. Local development and CI use Pi 1.0.2.
 - **Usage reporting counts spend even without another result fetch.** With `reportUsage` enabled, final settlement and shutdown persist any spend not already carried by a tool result. Aggregate entries do not affect context usage or attribute child spend to the parent model.
 - **The workflow stand-down now recognises a lowercase `workflow` tool** ([#283](https://github.com/tintinweb/pi-subagents/issues/283) — thanks [@zampierilucas](https://github.com/zampierilucas)). The match is exact on purpose, and the set held `Workflow` and `SubagentWorkflow` only, so `@quintinshaw/pi-dynamic-workflows` — which registers lowercase `workflow` — never tripped it: with `workflowsEnabled` unset, both orchestrators reached the model and nothing warned. Adding the third name is the whole fix; exactness is kept, so a `list_workflows` still cannot take the feature down.
 
