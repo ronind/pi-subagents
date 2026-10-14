@@ -27,6 +27,17 @@ describe("completion nudges remain retractable until delivery", () => {
     expect(await queue.drainBeforeSettle()).toEqual([]);
   });
 
+  it("drains immediately at a tool-batch boundary, rechecks unread results, and never repeats them", async () => {
+    let consumed = false;
+    queue.schedule("first", () => consumed ? undefined : message("first"));
+    queue.schedule("second", () => message("second"));
+    consumed = true;
+    expect(queue.drainAtTurnEnd()).toEqual([message("second")]);
+    expect(await queue.drainBeforeSettle()).toEqual([]);
+    vi.advanceTimersByTime(1000);
+    expect(send).not.toHaveBeenCalled();
+  });
+
   it("returns unread custom-message drafts to the host before CLI exit, only once", async () => {
     queue.schedule("agent", () => message("agent"));
     vi.advanceTimersByTime(1000);
@@ -78,6 +89,27 @@ describe("completion nudges remain retractable until delivery", () => {
     expect(send).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1);
     expect(send).toHaveBeenCalledExactlyOnceWith(message("agent"));
+  });
+
+  it("coalesces near-simultaneous idle completions without waiting for another hold", () => {
+    idle = true;
+    queue.schedule("first", () => ({ ...message("first"), details: { id: "first" } }));
+    vi.advanceTimersByTime(100);
+    queue.schedule("second", () => ({ ...message("second"), details: { id: "second" } }));
+    vi.advanceTimersByTime(100);
+    expect(send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      content: "2 background tasks finished.\n\nfirst\n\nsecond",
+      details: { id: "first", others: [{ id: "second" }] },
+    }));
+  });
+
+  it("does not merge a busy-origin completion into a later idle notification", async () => {
+    queue.schedule("held", () => message("held"));
+    idle = true;
+    queue.schedule("idle", () => message("idle"));
+    vi.advanceTimersByTime(200);
+    expect(send).toHaveBeenCalledExactlyOnceWith(message("idle"));
+    expect(await queue.drainBeforeSettle()).toEqual([message("held")]);
   });
 
   it("does not restart a parent that goes idle before a busy-origin hold expires", async () => {

@@ -44,7 +44,7 @@ describe("completion notifications across accepted resumes", () => {
   };
   const advance = async (ms: number) => { await vi.advanceTimersByTimeAsync(ms); await drain(); };
   const emit = async (name: string) => {
-    for (const hook of hooks.get(name) ?? []) await hook({ type: name }, ctx);
+    for (const hook of hooks.get(name) ?? []) await hook({ type: name, ...(name === "turn_end" ? { message: { role: "assistant", stopReason: "toolUse" } } : {}) }, ctx);
   };
   const settle = async () => {
     idle = true;
@@ -73,12 +73,12 @@ describe("completion notifications across accepted resumes", () => {
   }, undefined, undefined, ctx);
   const messages = () => [...settledMessages, ...sendMessage.mock.calls.map(([message]) => message.content)];
 
-  beforeEach(async () => {
+  beforeEach(async ({ task }) => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
     cwd = mkdtempSync(join(tmpdir(), "pi-resume-generation-"));
     previousCwd = process.cwd();
     mkdirSync(join(cwd, ".pi"));
-    writeFileSync(join(cwd, ".pi", "subagents.json"), JSON.stringify({ maxConcurrent: 1, schedulingEnabled: false }));
+    writeFileSync(join(cwd, ".pi", "subagents.json"), JSON.stringify({ maxConcurrent: 1, schedulingEnabled: false, defaultJoinMode: task.name.includes("group") ? "group" : "smart" }));
     process.chdir(cwd);
     tools = new Map(); hooks = new Map(); sendMessage = vi.fn<ExtensionAPI["sendMessage"]>();
     spawns = []; resumes = []; idle = false; settledMessages = [];
@@ -89,6 +89,7 @@ describe("completion notifications across accepted resumes", () => {
       sessionManager: { getSessionId: () => "regression", getBranch: () => [] },
       getSystemPrompt: () => "parent", isIdle: () => idle,
     } as unknown as ExtensionContext;
+    Object.defineProperty(ctx, "signal", { get: () => idle ? undefined : new AbortController().signal });
     vi.mocked(runAgent).mockImplementation(() => new Promise(resolve => {
       const run = spawns.length + 1;
       spawns.push(() => resolve({ responseText: `SPAWN_${run}`, session, aborted: false, steered: false }));
@@ -187,10 +188,11 @@ describe("completion notifications across accepted resumes", () => {
   it("does not let an unfinished old group claim its member's queued resume", async () => {
     const first = await spawn();
     const second = await spawn();
-    await advance(101); // group forms before either child completes
+    await emit("turn_end"); // group forms before either child completes
     spawns[0](); await drain();
     expect(spawns).toHaveLength(2);
     expect(textOf(await resume(first))).toContain("queued");
+    await emit("turn_end"); // register the resumed run's new turn
     expect(resumes).toHaveLength(0);
     spawns[1](); await drain(); // old group delivers; resumed run starts
     expect(resumes).toHaveLength(1);
@@ -207,13 +209,14 @@ describe("completion notifications across accepted resumes", () => {
   it("does not let a held old group include or duplicate a resumed member", async () => {
     const first = await spawn();
     const second = await spawn(); // queued behind first, still included in smart batch
-    await advance(101); // register the group
+    await emit("turn_end"); // register the turn's group
     spawns[0](); await drain();
     expect(spawns).toHaveLength(2);
     spawns[1](); await drain(); // group callback now holds both records
     await advance(250);
     expect(messages()).toEqual([]);
     await resume(first);
+    await emit("turn_end"); // register the resumed run's new turn
     await settle();
     expect(messages()).toHaveLength(1);
     expect(messages()[0]).toContain(second);

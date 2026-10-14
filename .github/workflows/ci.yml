@@ -11,52 +11,49 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run lint
-      - run: npm run typecheck
-      - run: npm run test
-      - run: npm run build
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm run check
+      - run: pnpm run build
 
-  # The primary job validates the pinned Pi 1.0.2 baseline. The floor job checks
-  # the earliest supported Pi: 0.87.1 introduced agent_before_settle, which keeps
-  # completion notifications retractable until the final actionable boundary.
+  # The oldest supported host still runs the full typecheck and test suite.
+  # Development and the build job use Pi 1.2.0; the peer floor remains 1.1.0.
   compat-floor-pi:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Install floor Pi
-        run: npm install --no-save @earendil-works/pi-coding-agent@0.87.1 @earendil-works/pi-ai@0.87.1 @earendil-works/pi-tui@0.87.1
+        run: pnpm add --save-dev --ignore-scripts @earendil-works/pi-coding-agent@1.1.0 @earendil-works/pi-ai@1.1.0 @earendil-works/pi-tui@1.1.0
       - name: Typecheck against floor Pi
-        run: npm run typecheck
+        run: pnpm run typecheck
       - name: Test suite against floor Pi
-        run: npx vitest run --reporter=dot
+        run: pnpm exec vitest run --reporter=dot
 
-  # Forward canary: reinstall whatever Pi is `latest` over the pin, so a release newer than
-  # the baseline surfaces here before it reaches users. It runs the full typecheck + suite,
-  # not a hand-picked file list, so new drift can't hide in a test nobody remembered to add
-  # here. The pinned baseline is Pi 1.0.2.
+  # Forward canary: a newer host surfaces drift without changing the baseline.
   compat-latest-pi:
     runs-on: ubuntu-latest
-    continue-on-error: true # current Pi is not a hard support guarantee; surface breakage without blocking
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Install current Pi
-        run: npm install --no-save @earendil-works/pi-coding-agent@latest @earendil-works/pi-ai@latest @earendil-works/pi-tui@latest
+        run: pnpm add --save-dev --ignore-scripts @earendil-works/pi-coding-agent@latest @earendil-works/pi-ai@latest @earendil-works/pi-tui@latest
       - name: Typecheck against current Pi
-        run: npm run typecheck
+        run: pnpm run typecheck
       - name: Test suite against current Pi
-        run: npx vitest run --reporter=dot
+        run: pnpm exec vitest run --reporter=dot

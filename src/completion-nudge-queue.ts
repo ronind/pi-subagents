@@ -1,10 +1,13 @@
 import type { CustomMessageEntryDraft } from "@earendil-works/pi-coding-agent";
+import { combineCompletionMessages } from "./completion-outbox.js";
+import type { NotificationDetails } from "./types.js";
 
 /** Hold completion messages outside Pi's non-retractable follow-up queue. */
 export class CompletionNudgeQueue {
   private pending = new Map<string, {
     build: () => CustomMessageEntryDraft | undefined;
     due: number;
+    scheduledWhileIdle: boolean;
     timer: ReturnType<typeof setTimeout>;
   }>();
   private disposed = false;
@@ -21,12 +24,19 @@ export class CompletionNudgeQueue {
     const entry = {
       build,
       due: Date.now() + delay,
+      scheduledWhileIdle,
       timer: setTimeout(() => {
         if (!scheduledWhileIdle || !this.isIdle() || this.disposed || this.pending.get(key) !== entry) return;
-        this.pending.delete(key);
+        const messages = this.drainAtTurnEnd(true);
         try {
-          const message = entry.build();
-          if (message) this.send(message);
+          if (messages.length === 1) this.send(messages[0]);
+          else if (messages.length > 1) this.send({
+            ...messages[0],
+            ...combineCompletionMessages(messages.map(message => ({
+              content: message.content as string,
+              details: message.details as NotificationDetails,
+            }))),
+          });
         } catch { /* ignore stale completion side-effect errors */ }
       }, delay),
     };
@@ -69,6 +79,21 @@ export class CompletionNudgeQueue {
         const message = entry.build();
         if (message) messages.push(message);
       } catch { /* one stale completion must not discard the remaining results */ }
+    }
+    return messages;
+  }
+
+  /** Tool-batch boundary: no idle hold is needed before the next model call. */
+  drainAtTurnEnd(idleOnly = false): CustomMessageEntryDraft[] {
+    if (this.disposed) return [];
+    const messages: CustomMessageEntryDraft[] = [];
+    for (const [key, entry] of [...this.pending]) {
+      if (idleOnly && !entry.scheduledWhileIdle) continue;
+      this.cancel(key);
+      try {
+        const message = entry.build();
+        if (message) messages.push(message);
+      } catch { /* isolate stale completions */ }
     }
     return messages;
   }

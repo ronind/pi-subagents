@@ -10,10 +10,12 @@ import { runAgent } from "../src/agent-runner.js";
 import { CompletionNudgeQueue } from "../src/completion-nudge-queue.js";
 import { GroupJoinManager } from "../src/group-join.js";
 import subagentsExtension from "../src/index.js";
+import { type Hermetic, hermeticDir } from "./helpers/boot-extension.js";
 
 /** Exercise the real extension tools, consumption flags, grouping and hooks. */
 describe("individual AND grouped completion delivery", () => {
   type Hook = (event: { type: string }, ctx: ExtensionContext) => unknown;
+  let hermetic: Hermetic;
   let tools: Map<string, ToolDefinition>;
   let hooks: Map<string, Hook[]>;
   let pi: ReturnType<typeof makePi>;
@@ -34,7 +36,7 @@ describe("individual AND grouped completion delivery", () => {
   const textOf = (r: Awaited<ReturnType<ToolDefinition["execute"]>>) =>
     r.content.map(c => c.type === "text" ? c.text : "").join("");
   const emit = async (name: string) => {
-    for (const handler of hooks.get(name) ?? []) await handler({ type: name }, ctx);
+    for (const handler of hooks.get(name) ?? []) await handler({ type: name, ...(name === "turn_end" ? { message: { role: "assistant", stopReason: "toolUse" } } : {}) }, ctx);
   };
   const drain = async () => {
     await new Promise<void>(resolve => setImmediate(resolve));
@@ -65,8 +67,9 @@ describe("individual AND grouped completion delivery", () => {
     await emit("agent_settled");
   };
 
-  beforeEach(async () => {
+  beforeEach(async ({ task }) => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+    hermetic = hermeticDir({ settings: { defaultJoinMode: /group|partial-timeout/.test(task.name) ? "group" : "smart", schedulingEnabled: false } });
     idle = false;
     tools = new Map();
     hooks = new Map();
@@ -80,6 +83,7 @@ describe("individual AND grouped completion delivery", () => {
       sessionManager: { getSessionId: () => "local-regression", getBranch: () => [] },
       getSystemPrompt: () => "parent", isIdle: () => idle,
     } as unknown as ExtensionContext;
+    Object.defineProperty(ctx, "signal", { get: () => idle ? undefined : new AbortController().signal });
     pi = makePi();
     vi.mocked(runAgent).mockImplementation(() => new Promise(resolve => {
       finish.push(() => resolve({
@@ -95,6 +99,7 @@ describe("individual AND grouped completion delivery", () => {
     await drain();
     await emit("session_shutdown");
     vi.useRealTimers();
+    hermetic.restore();
   });
 
   it("suppresses an individual result retrieved seconds after completion", async () => {
@@ -146,6 +151,7 @@ describe("individual AND grouped completion delivery", () => {
 
   it("suppresses a fully consumed group", async () => {
     const ids = [await spawn(), await spawn()];
+    await emit("turn_end");
     for (const done of finish) done();
     await drain();
     await advance(3000);
@@ -158,6 +164,7 @@ describe("individual AND grouped completion delivery", () => {
 
   it("rebuilds a partial group from only the still-unread records", async () => {
     const ids = [await spawn(), await spawn()];
+    await emit("turn_end");
     for (const done of finish) done();
     await drain();
     await advance(3000);
@@ -213,7 +220,7 @@ describe("individual AND grouped completion delivery", () => {
 
   it("drops a consumed partial-timeout batch, but delivers the unread straggler", async () => {
     const ids = [await spawn(), await spawn()];
-    await advance(100); // register smart-join group
+    await emit("turn_end"); // register the parent turn's group
     finish[0]();
     await drain();
     await advance(31_000);
@@ -242,7 +249,7 @@ describe("individual AND grouped completion delivery", () => {
   it("clears held group timers on confirmed shutdown", async () => {
     await spawn();
     await spawn();
-    await advance(100);
+    await emit("turn_end");
     finish[0]();
     await drain();
     const dispose = vi.spyOn(GroupJoinManager.prototype, "dispose");
