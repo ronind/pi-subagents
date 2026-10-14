@@ -659,7 +659,7 @@ Sending a foreground agent to the background moves its slot: it gives up the for
 
 ## Join Strategies
 
-When background agents complete, they notify the main agent. As in Claude Code, a notification reaches a busy parent after its current batch of tool calls, before its next model call — running tools are not interrupted — and everything that finished during that batch arrives as one message. An idle parent gets a turn about 200 ms after a completion, together with anything else that finished in that window. If you interrupt the parent (Esc), already-held agent results wait for the next successful boundary rather than restarting an aborted or navigating session. The **join mode** decides whether a result waits for its siblings. It applies only to background agents.
+When background agents complete, they notify the main agent. As in Claude Code, a notification reaches a busy parent after its current batch of tool calls, before its next model call — running tools are not interrupted — and everything that finished during that batch arrives as one message. An idle parent gets a turn about 200 ms after a completion, together with anything else that finished in that window. If you interrupt the parent (Esc), already-held unread results are re-armed once the parent has genuinely settled idle. Navigation teardown does not restart the outgoing session. The **join mode** decides whether a result waits for its siblings. It applies only to background agents.
 
 | Mode | Behavior |
 |------|----------|
@@ -679,8 +679,12 @@ handle) or RPC consume suppresses it while it is still held locally.
 This does not wait for children still running when a one-shot CLI settles;
 join those explicitly. Already-enqueued Pi messages cannot be withdrawn. A
 completion parked before an aborted or failed parent run remains pending until
-a subsequent successful boundary; session shutdown drops pending notifications.
-Workflow completion delivery is unchanged.
+explicit idle settlement, or a subsequent successful boundary. Settlement also
+re-arms results that finished after the pre-settle drain. The remaining 200 ms
+hold is preserved, and consumption and resume generation are checked again at
+delivery. Navigation teardown and session shutdown suppress pending notices.
+Merely observing an idle parent without a settlement event does not release
+busy-origin notices. Workflow completion delivery is unchanged.
 
 **Configuration:**
 - Configure join mode in `/agents` → Settings → Join mode

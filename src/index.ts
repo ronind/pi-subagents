@@ -473,13 +473,23 @@ export default function (pi: ExtensionAPI) {
     if (usage) sessionManager.appendUsage("subagent", "pi-subagents", "aggregate", usage,
       "Aggregate subagent usage not reported by tool results");
   }
+  // Navigation aborts the outgoing run before shutdown, emitting agent_settled
+  // into a session that must not be restarted. A vetoed navigation can resume
+  // ordinary delivery at its next successful boundary or new run.
+  let navigationPending = false;
   const completionNudges = new CompletionNudgeQueue(
-    () => currentCtx?.isIdle?.() ?? currentCtx?.signal === undefined,
+    () => !navigationPending && (currentCtx?.isIdle?.() ?? currentCtx?.signal === undefined),
     message => pi.sendMessage(message, { deliverAs: "steer", triggerTurn: true }),
   );
-  pi.on("agent_start", (_event, ctx) => { currentCtx = ctx; });
+  pi.on("agent_start", (_event, ctx) => { currentCtx = ctx; navigationPending = false; });
+  function holdNavigationSettlement(_event: unknown, ctx: ExtensionContext): void {
+    if (!(ctx?.isIdle?.() ?? currentCtx?.isIdle?.() ?? currentCtx?.signal === undefined)) navigationPending = true;
+  }
+  pi.on("session_before_switch", holdNavigationSettlement);
+  pi.on("session_before_fork", holdNavigationSettlement);
   pi.on("agent_before_settle", async (event, ctx) => {
     if (event.outcome !== "completed" || ctx.signal?.aborted) return;
+    navigationPending = false;
     const entries = await completionNudges.drainBeforeSettle(ctx.signal);
     if (entries.length === 0 || ctx.signal?.aborted) return;
     return { entries: [...event.entries, ...entries], continue: true };
@@ -1578,6 +1588,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_end", () => outbox.onAgentEnd());
   pi.on("agent_settled", (_event, ctx) => {
     if (ctx) flushPendingUsage(ctx);
+    completionNudges.onAgentSettled();
     outbox.onAgentEnd();
   });
 

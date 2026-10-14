@@ -3,10 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<Record<string, unknown>>("../src/agent-runner.js");
-  return { ...actual, runAgent: vi.fn() };
+  return { ...actual, runAgent: vi.fn(), resumeAgent: vi.fn() };
 });
 
-import { runAgent } from "../src/agent-runner.js";
+import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import { CompletionNudgeQueue } from "../src/completion-nudge-queue.js";
 import { GroupJoinManager } from "../src/group-join.js";
 import subagentsExtension from "../src/index.js";
@@ -87,7 +87,7 @@ describe("individual AND grouped completion delivery", () => {
     pi = makePi();
     vi.mocked(runAgent).mockImplementation(() => new Promise(resolve => {
       finish.push(() => resolve({
-        responseText: "CHILD_RESULT", session: { dispose: vi.fn() } as unknown as AgentSession,
+        responseText: "CHILD_RESULT", session: { dispose: vi.fn(), messages: [] } as unknown as AgentSession,
         aborted: false, steered: false,
       }));
     }));
@@ -208,6 +208,106 @@ describe("individual AND grouped completion delivery", () => {
     expect(settledEntries).toEqual([]);
   });
 
+  it("reconciles a busy completion after Esc settlement without another user run", async () => {
+    const id = await spawn();
+    finish[0]();
+    await drain();
+    await advance(100);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    // Esc skips agent_before_settle entirely.
+    idle = true;
+    await emit("agent_settled");
+    await advance(99);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    await advance(1);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage.mock.calls[0][0].content).toContain(id);
+    await advance(1000);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(settledEntries).toEqual([]);
+  });
+
+  it("reconciles a child finishing after the first pre-settle drain", async () => {
+    const id = await spawn();
+    const result = await hooks.get("agent_before_settle")![0](
+      { type: "agent_before_settle", outcome: "completed", entries: [] }, ctx,
+    );
+    expect(result).toBeUndefined();
+    // A later extension is still awaiting its pre-settle handler.
+    finish[0]();
+    await drain();
+    await advance(300);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    idle = true;
+    await emit("agent_settled");
+    await advance(1);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage.mock.calls[0][0].content).toContain(id);
+    await emit("agent_settled");
+    await advance(1000);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("still checks consumption when a settled nudge is re-armed", async () => {
+    const id = await spawn();
+    finish[0]();
+    await drain();
+    idle = true;
+    await emit("agent_settled");
+    const cancel = vi.spyOn(CompletionNudgeQueue.prototype, "cancel").mockImplementation(() => {});
+    try { await consume(id); } finally { cancel.mockRestore(); }
+    await advance(1000);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("still checks generation when a settled nudge is re-armed", async () => {
+    const id = await spawn();
+    finish[0]();
+    await drain();
+    idle = true;
+    await emit("agent_settled");
+    vi.mocked(resumeAgent).mockImplementation(() => new Promise(resolve => {
+      finish.push(() => resolve({ text: "RESUMED_RESULT" }));
+    }));
+    await tools.get("Agent")!.execute("resume", {
+      prompt: "again", description: "resume", subagent_type: "general-purpose",
+      resume: id, run_in_background: true,
+    }, undefined, undefined, ctx);
+    await advance(1000);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    finish[1]();
+    await drain();
+    await advance(200);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage.mock.calls[0][0].content).toContain("RESUMED_RESULT");
+    expect(pi.sendMessage.mock.calls[0][0].content).not.toContain("CHILD_RESULT");
+  });
+
+  it("cancels re-armed settled notices on confirmed shutdown", async () => {
+    await spawn();
+    finish[0]();
+    await drain();
+    idle = true;
+    await emit("agent_settled");
+    await emit("session_shutdown");
+    await advance(1000);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not reconcile a settlement while the parent is still busy", async () => {
+    const id = await spawn();
+    finish[0]();
+    await drain();
+    await emit("agent_settled");
+    await advance(1000);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    idle = true;
+    await emit("agent_settled");
+    await advance(1);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
+    expect(pi.sendMessage.mock.calls[0][0].content).toContain(id);
+  });
+
   it("still notifies an idle parent without waiting for another settle", async () => {
     const id = await spawn();
     await settle();
@@ -301,6 +401,20 @@ describe("individual AND grouped completion delivery", () => {
       await advance(1000);
       expect(pi.sendMessage).toHaveBeenCalledTimes(1);
       expect(pi.sendMessage.mock.calls[0][0].content).toContain(id);
+    });
+
+    it(`does not notify for a child finishing during async ${navigation} teardown`, async () => {
+      await spawn();
+      await emit(navigation);
+      idle = true;
+      await emit("agent_settled");
+      finish[0]();
+      await drain();
+      await advance(1000);
+      expect(pi.sendMessage).not.toHaveBeenCalled();
+      await emit("session_shutdown");
+      await advance(1000);
+      expect(pi.sendMessage).not.toHaveBeenCalled();
     });
 
     it(`does not flush parked entries during async ${navigation} teardown`, async () => {

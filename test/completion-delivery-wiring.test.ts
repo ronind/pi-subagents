@@ -138,11 +138,14 @@ describe("completion delivery to a running parent", () => {
 
     runs.settle("alpha"); // lands while a later agent_end listener still holds the run open
     await vi.advanceTimersByTimeAsync(0);
+    // Pi runs the actionable pre-settle boundary before its notification-only
+    // settled event; do not ask the host to settle an already-settled run.
+    const entries = await settleBoundary(b, b.parentCtx);
     b.parent.running = false;
     b.lifecycle.get("agent_settled")?.({ type: "agent_settled", aborted: false });
     await vi.advanceTimersByTimeAsync(200);
 
-    expect(await settleBoundary(b, b.parentCtx)).toEqual([expect.stringContaining("alpha done")]);
+    expect(entries).toEqual([expect.stringContaining("alpha done")]);
     expect(sentContents(b)).toEqual([]);
   });
 

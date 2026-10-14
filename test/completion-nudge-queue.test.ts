@@ -103,6 +103,23 @@ describe("completion nudges remain retractable until delivery", () => {
     }));
   });
 
+  it("coalesces busy-origin completions after explicit idle settlement", () => {
+    queue.schedule("first", () => ({ ...message("first"), details: { id: "first" } }));
+    vi.advanceTimersByTime(100);
+    queue.schedule("second", () => ({ ...message("second"), details: { id: "second" } }));
+    idle = true;
+    queue.onAgentSettled();
+    vi.advanceTimersByTime(99);
+    expect(send).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      content: "2 background tasks finished.\n\nfirst\n\nsecond",
+      details: { id: "first", others: [{ id: "second" }] },
+    }));
+    vi.advanceTimersByTime(1000);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
   it("does not merge a busy-origin completion into a later idle notification", async () => {
     queue.schedule("held", () => message("held"));
     idle = true;
